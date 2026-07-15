@@ -1,0 +1,926 @@
+```python
+"""Wideband phased-array and true-time-delay beamforming utilities."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from numpy.typing import NDArray
+
+
+SPEED_OF_LIGHT_M_S = 299_792_458.0
+
+
+@dataclass(frozen=True)
+class WidebandBeamformerResult:
+    """Frequency-angle response of a wideband antenna array."""
+
+    frequencies_hz: NDArray[np.float64]
+    angles_deg: NDArray[np.float64]
+    array_factor: NDArray[np.complex128]
+    magnitude: NDArray[np.float64]
+    magnitude_db: NDArray[np.float64]
+    peak_angles_deg: NDArray[np.float64]
+    steering_errors_deg: NDArray[np.float64]
+    reference_frequency_hz: float
+    requested_steering_angle_deg: float
+    beamforming_method: str
+
+
+@dataclass(frozen=True)
+class BeamSquintMetrics:
+    """Summary metrics for frequency-dependent beam-pointing error."""
+
+    frequencies_hz: NDArray[np.float64]
+    peak_angles_deg: NDArray[np.float64]
+    steering_errors_deg: NDArray[np.float64]
+    maximum_absolute_squint_deg: float
+    rms_squint_deg: float
+    peak_to_peak_squint_deg: float
+    worst_frequency_hz: float
+    worst_peak_angle_deg: float
+
+
+def calculate_phase_shifter_weights(
+    number_of_elements: int,
+    reference_frequency_hz: float,
+    element_spacing_m: float,
+    steering_angle_deg: float,
+    *,
+    amplitude_weights: NDArray[np.float64] | None = None,
+    normalize_amplitude: bool = True,
+) -> NDArray[np.complex128]:
+    """
+    Generate frequency-independent phase-shifter weights.
+
+    The phase shifts are designed at ``reference_frequency_hz``. At
+    frequencies away from the reference, the fixed phase shifts cause
+    beam squint.
+
+    The weight of element n is
+
+        w_n = a_n exp(
+            -j 2π f_ref n d sin(theta_0) / c
+        ).
+    """
+
+    _validate_array_inputs(
+        number_of_elements=number_of_elements,
+        frequency_hz=reference_frequency_hz,
+        element_spacing_m=element_spacing_m,
+        steering_angle_deg=steering_angle_deg,
+    )
+
+    amplitudes = _prepare_amplitude_weights(
+        number_of_elements=number_of_elements,
+        amplitude_weights=amplitude_weights,
+        normalize_amplitude=normalize_amplitude,
+    )
+
+    element_indices = np.arange(
+        number_of_elements,
+        dtype=np.float64,
+    )
+
+    steering_angle_rad = np.deg2rad(
+        steering_angle_deg
+    )
+
+    phase_rad = (
+        -2.0
+        * np.pi
+        * reference_frequency_hz
+        * element_indices
+        * element_spacing_m
+        * np.sin(steering_angle_rad)
+        / SPEED_OF_LIGHT_M_S
+    )
+
+    return (
+        amplitudes
+        * np.exp(1j * phase_rad)
+    ).astype(np.complex128)
+
+
+def calculate_true_time_delays(
+    number_of_elements: int,
+    element_spacing_m: float,
+    steering_angle_deg: float,
+    *,
+    center_delays: bool = False,
+) -> NDArray[np.float64]:
+    """
+    Calculate ideal per-element true-time delays for a ULA.
+
+    The relative delay is
+
+        tau_n = n d sin(theta_0) / c.
+
+    When ``center_delays`` is True, the mean delay is removed. This
+    produces positive and negative relative delays around zero.
+    """
+
+    if isinstance(
+        number_of_elements,
+        bool,
+    ) or not isinstance(
+        number_of_elements,
+        (int, np.integer),
+    ):
+        raise TypeError(
+            "number_of_elements must be an integer."
+        )
+
+    if number_of_elements < 2:
+        raise ValueError(
+            "number_of_elements must be at least 2."
+        )
+
+    _validate_positive_finite(
+        element_spacing_m,
+        name="element_spacing_m",
+    )
+
+    _validate_angle(
+        steering_angle_deg,
+        name="steering_angle_deg",
+    )
+
+    element_indices = np.arange(
+        number_of_elements,
+        dtype=np.float64,
+    )
+
+    steering_angle_rad = np.deg2rad(
+        steering_angle_deg
+    )
+
+    delays_s = (
+        element_indices
+        * element_spacing_m
+        * np.sin(steering_angle_rad)
+        / SPEED_OF_LIGHT_M_S
+    )
+
+    if center_delays:
+        delays_s -= np.mean(delays_s)
+
+    return delays_s.astype(np.float64)
+
+
+def calculate_ttd_weights(
+    frequency_hz: float,
+    delays_s: NDArray[np.float64],
+    *,
+    amplitude_weights: NDArray[np.float64] | None = None,
+    normalize_amplitude: bool = True,
+) -> NDArray[np.complex128]:
+    """
+    Convert true-time delays into frequency-dependent complex weights.
+
+    For a delay tau_n, the complex weight at frequency f is
+
+        w_n(f) = a_n exp(-j 2π f tau_n).
+    """
+
+    _validate_positive_finite(
+        frequency_hz,
+        name="frequency_hz",
+    )
+
+    prepared_delays = np.asarray(
+        delays_s,
+        dtype=np.float64,
+    )
+
+    if prepared_delays.ndim != 1:
+        raise ValueError(
+            "delays_s must be one-dimensional."
+        )
+
+    if prepared_delays.size < 2:
+        raise ValueError(
+            "delays_s must contain at least two values."
+        )
+
+    if not np.all(np.isfinite(prepared_delays)):
+        raise ValueError(
+            "delays_s contains non-finite values."
+        )
+
+    amplitudes = _prepare_amplitude_weights(
+        number_of_elements=prepared_delays.size,
+        amplitude_weights=amplitude_weights,
+        normalize_amplitude=normalize_amplitude,
+    )
+
+    phase_rad = (
+        -2.0
+        * np.pi
+        * frequency_hz
+        * prepared_delays
+    )
+
+    return (
+        amplitudes
+        * np.exp(1j * phase_rad)
+    ).astype(np.complex128)
+
+
+def calculate_wideband_phase_shifter_response(
+    number_of_elements: int,
+    frequencies_hz: NDArray[np.float64],
+    reference_frequency_hz: float,
+    element_spacing_m: float,
+    steering_angle_deg: float,
+    *,
+    angles_deg: NDArray[np.float64] | None = None,
+    amplitude_weights: NDArray[np.float64] | None = None,
+    minimum_db: float = -100.0,
+) -> WidebandBeamformerResult:
+    """
+    Calculate a wideband response using fixed phase-shifter weights.
+
+    The phase shifts are optimized at one reference frequency and held
+    fixed at all other frequencies.
+    """
+
+    _validate_array_inputs(
+        number_of_elements=number_of_elements,
+        frequency_hz=reference_frequency_hz,
+        element_spacing_m=element_spacing_m,
+        steering_angle_deg=steering_angle_deg,
+    )
+
+    frequency_vector = _prepare_frequency_vector(
+        frequencies_hz
+    )
+
+    observation_angles = _prepare_angles(
+        angles_deg
+    )
+
+    _validate_minimum_db(
+        minimum_db
+    )
+
+    weights = calculate_phase_shifter_weights(
+        number_of_elements=number_of_elements,
+        reference_frequency_hz=reference_frequency_hz,
+        element_spacing_m=element_spacing_m,
+        steering_angle_deg=steering_angle_deg,
+        amplitude_weights=amplitude_weights,
+    )
+
+    array_factor = _calculate_frequency_angle_response(
+        number_of_elements=number_of_elements,
+        frequencies_hz=frequency_vector,
+        element_spacing_m=element_spacing_m,
+        angles_deg=observation_angles,
+        weights_by_frequency=np.broadcast_to(
+            weights,
+            (
+                frequency_vector.size,
+                number_of_elements,
+            ),
+        ),
+    )
+
+    return _build_result(
+        frequencies_hz=frequency_vector,
+        angles_deg=observation_angles,
+        array_factor=array_factor,
+        reference_frequency_hz=reference_frequency_hz,
+        steering_angle_deg=steering_angle_deg,
+        method="phase_shifter",
+        minimum_db=minimum_db,
+    )
+
+
+def calculate_wideband_ttd_response(
+    number_of_elements: int,
+    frequencies_hz: NDArray[np.float64],
+    reference_frequency_hz: float,
+    element_spacing_m: float,
+    steering_angle_deg: float,
+    *,
+    angles_deg: NDArray[np.float64] | None = None,
+    amplitude_weights: NDArray[np.float64] | None = None,
+    minimum_db: float = -100.0,
+) -> WidebandBeamformerResult:
+    """
+    Calculate a wideband response using ideal true-time delays.
+
+    Unlike phase shifters, ideal time delays preserve the requested
+    steering direction across frequency.
+    """
+
+    _validate_array_inputs(
+        number_of_elements=number_of_elements,
+        frequency_hz=reference_frequency_hz,
+        element_spacing_m=element_spacing_m,
+        steering_angle_deg=steering_angle_deg,
+    )
+
+    frequency_vector = _prepare_frequency_vector(
+        frequencies_hz
+    )
+
+    observation_angles = _prepare_angles(
+        angles_deg
+    )
+
+    _validate_minimum_db(
+        minimum_db
+    )
+
+    delays_s = calculate_true_time_delays(
+        number_of_elements=number_of_elements,
+        element_spacing_m=element_spacing_m,
+        steering_angle_deg=steering_angle_deg,
+    )
+
+    amplitudes = _prepare_amplitude_weights(
+        number_of_elements=number_of_elements,
+        amplitude_weights=amplitude_weights,
+        normalize_amplitude=True,
+    )
+
+    phase_matrix = (
+        -2.0
+        * np.pi
+        * frequency_vector[:, np.newaxis]
+        * delays_s[np.newaxis, :]
+    )
+
+    weights_by_frequency = (
+        amplitudes[np.newaxis, :]
+        * np.exp(1j * phase_matrix)
+    ).astype(np.complex128)
+
+    array_factor = _calculate_frequency_angle_response(
+        number_of_elements=number_of_elements,
+        frequencies_hz=frequency_vector,
+        element_spacing_m=element_spacing_m,
+        angles_deg=observation_angles,
+        weights_by_frequency=weights_by_frequency,
+    )
+
+    return _build_result(
+        frequencies_hz=frequency_vector,
+        angles_deg=observation_angles,
+        array_factor=array_factor,
+        reference_frequency_hz=reference_frequency_hz,
+        steering_angle_deg=steering_angle_deg,
+        method="true_time_delay",
+        minimum_db=minimum_db,
+    )
+
+
+def calculate_predicted_phase_shifter_peak_angle(
+    frequencies_hz: NDArray[np.float64],
+    reference_frequency_hz: float,
+    steering_angle_deg: float,
+) -> NDArray[np.float64]:
+    """
+    Predict phase-shifter beam squint analytically.
+
+    For a phase-shifter array,
+
+        sin(theta_peak(f))
+            = f_ref / f * sin(theta_0).
+
+    Frequencies for which the right-hand side exceeds unity are clipped
+    to the visible angular boundary.
+    """
+
+    frequency_vector = _prepare_frequency_vector(
+        frequencies_hz
+    )
+
+    _validate_positive_finite(
+        reference_frequency_hz,
+        name="reference_frequency_hz",
+    )
+
+    _validate_angle(
+        steering_angle_deg,
+        name="steering_angle_deg",
+    )
+
+    steering_sine = np.sin(
+        np.deg2rad(
+            steering_angle_deg
+        )
+    )
+
+    predicted_sine = (
+        reference_frequency_hz
+        / frequency_vector
+        * steering_sine
+    )
+
+    predicted_sine = np.clip(
+        predicted_sine,
+        -1.0,
+        1.0,
+    )
+
+    return np.rad2deg(
+        np.arcsin(
+            predicted_sine
+        )
+    ).astype(np.float64)
+
+
+def analyze_beam_squint(
+    result: WidebandBeamformerResult,
+) -> BeamSquintMetrics:
+    """Calculate summary beam-squint metrics."""
+
+    if not isinstance(
+        result,
+        WidebandBeamformerResult,
+    ):
+        raise TypeError(
+            "result must be a WidebandBeamformerResult."
+        )
+
+    absolute_error = np.abs(
+        result.steering_errors_deg
+    )
+
+    worst_index = int(
+        np.argmax(
+            absolute_error
+        )
+    )
+
+    return BeamSquintMetrics(
+        frequencies_hz=result.frequencies_hz.copy(),
+        peak_angles_deg=result.peak_angles_deg.copy(),
+        steering_errors_deg=(
+            result.steering_errors_deg.copy()
+        ),
+        maximum_absolute_squint_deg=float(
+            absolute_error[worst_index]
+        ),
+        rms_squint_deg=float(
+            np.sqrt(
+                np.mean(
+                    result.steering_errors_deg**2
+                )
+            )
+        ),
+        peak_to_peak_squint_deg=float(
+            np.max(
+                result.peak_angles_deg
+            )
+            - np.min(
+                result.peak_angles_deg
+            )
+        ),
+        worst_frequency_hz=float(
+            result.frequencies_hz[
+                worst_index
+            ]
+        ),
+        worst_peak_angle_deg=float(
+            result.peak_angles_deg[
+                worst_index
+            ]
+        ),
+    )
+
+
+def calculate_fractional_bandwidth(
+    minimum_frequency_hz: float,
+    maximum_frequency_hz: float,
+) -> float:
+    """
+    Calculate fractional bandwidth relative to arithmetic center frequency.
+
+    The result is
+
+        (f_max - f_min) / ((f_max + f_min) / 2).
+    """
+
+    _validate_positive_finite(
+        minimum_frequency_hz,
+        name="minimum_frequency_hz",
+    )
+
+    _validate_positive_finite(
+        maximum_frequency_hz,
+        name="maximum_frequency_hz",
+    )
+
+    if maximum_frequency_hz <= minimum_frequency_hz:
+        raise ValueError(
+            "maximum_frequency_hz must exceed minimum_frequency_hz."
+        )
+
+    center_frequency_hz = (
+        minimum_frequency_hz
+        + maximum_frequency_hz
+    ) / 2.0
+
+    return float(
+        (
+            maximum_frequency_hz
+            - minimum_frequency_hz
+        )
+        / center_frequency_hz
+    )
+
+
+def _calculate_frequency_angle_response(
+    number_of_elements: int,
+    frequencies_hz: NDArray[np.float64],
+    element_spacing_m: float,
+    angles_deg: NDArray[np.float64],
+    weights_by_frequency: NDArray[np.complex128],
+) -> NDArray[np.complex128]:
+    """Calculate array factor over frequency and angle."""
+
+    if weights_by_frequency.shape != (
+        frequencies_hz.size,
+        number_of_elements,
+    ):
+        raise ValueError(
+            "weights_by_frequency has an invalid shape."
+        )
+
+    element_indices = np.arange(
+        number_of_elements,
+        dtype=np.float64,
+    )
+
+    angle_sines = np.sin(
+        np.deg2rad(
+            angles_deg
+        )
+    )
+
+    spatial_phase = (
+        2.0
+        * np.pi
+        * frequencies_hz[:, np.newaxis, np.newaxis]
+        / SPEED_OF_LIGHT_M_S
+        * element_spacing_m
+        * element_indices[
+            np.newaxis,
+            :,
+            np.newaxis,
+        ]
+        * angle_sines[
+            np.newaxis,
+            np.newaxis,
+            :,
+        ]
+    )
+
+    propagation_matrix = np.exp(
+        1j * spatial_phase
+    )
+
+    return np.sum(
+        weights_by_frequency[
+            :,
+            :,
+            np.newaxis,
+        ]
+        * propagation_matrix,
+        axis=1,
+    ).astype(np.complex128)
+
+
+def _build_result(
+    frequencies_hz: NDArray[np.float64],
+    angles_deg: NDArray[np.float64],
+    array_factor: NDArray[np.complex128],
+    reference_frequency_hz: float,
+    steering_angle_deg: float,
+    method: str,
+    minimum_db: float,
+) -> WidebandBeamformerResult:
+    """Normalize a wideband response and locate frequency-wise peaks."""
+
+    magnitude = np.abs(
+        array_factor
+    ).astype(np.float64)
+
+    frequency_maximum = np.max(
+        magnitude,
+        axis=1,
+        keepdims=True,
+    )
+
+    normalized_magnitude = np.divide(
+        magnitude,
+        frequency_maximum,
+        out=np.zeros_like(
+            magnitude
+        ),
+        where=frequency_maximum > 0.0,
+    )
+
+    minimum_linear = 10.0 ** (
+        minimum_db / 20.0
+    )
+
+    magnitude_db = (
+        20.0
+        * np.log10(
+            np.maximum(
+                normalized_magnitude,
+                minimum_linear,
+            )
+        )
+    )
+
+    magnitude_db = np.maximum(
+        magnitude_db,
+        minimum_db,
+    )
+
+    peak_indices = np.argmax(
+        magnitude_db,
+        axis=1,
+    )
+
+    peak_angles_deg = angles_deg[
+        peak_indices
+    ]
+
+    steering_errors_deg = (
+        peak_angles_deg
+        - steering_angle_deg
+    )
+
+    return WidebandBeamformerResult(
+        frequencies_hz=frequencies_hz.copy(),
+        angles_deg=angles_deg.copy(),
+        array_factor=np.asarray(
+            array_factor,
+            dtype=np.complex128,
+        ),
+        magnitude=np.asarray(
+            normalized_magnitude,
+            dtype=np.float64,
+        ),
+        magnitude_db=np.asarray(
+            magnitude_db,
+            dtype=np.float64,
+        ),
+        peak_angles_deg=np.asarray(
+            peak_angles_deg,
+            dtype=np.float64,
+        ),
+        steering_errors_deg=np.asarray(
+            steering_errors_deg,
+            dtype=np.float64,
+        ),
+        reference_frequency_hz=float(
+            reference_frequency_hz
+        ),
+        requested_steering_angle_deg=float(
+            steering_angle_deg
+        ),
+        beamforming_method=method,
+    )
+
+
+def _prepare_amplitude_weights(
+    number_of_elements: int,
+    amplitude_weights: NDArray[np.float64] | None,
+    normalize_amplitude: bool,
+) -> NDArray[np.float64]:
+    """Validate and normalize real amplitude weights."""
+
+    if amplitude_weights is None:
+        amplitudes = np.ones(
+            number_of_elements,
+            dtype=np.float64,
+        )
+    else:
+        amplitudes = np.asarray(
+            amplitude_weights,
+            dtype=np.float64,
+        )
+
+    if amplitudes.shape != (
+        number_of_elements,
+    ):
+        raise ValueError(
+            "amplitude_weights must contain one value per element."
+        )
+
+    if not np.all(np.isfinite(amplitudes)):
+        raise ValueError(
+            "amplitude_weights contains non-finite values."
+        )
+
+    if np.any(amplitudes < 0.0):
+        raise ValueError(
+            "amplitude_weights cannot contain negative values."
+        )
+
+    if np.allclose(
+        amplitudes,
+        0.0,
+    ):
+        raise ValueError(
+            "amplitude_weights cannot contain only zeros."
+        )
+
+    if normalize_amplitude:
+        amplitudes = amplitudes / np.max(
+            amplitudes
+        )
+
+    return amplitudes.astype(np.float64)
+
+
+def _prepare_frequency_vector(
+    frequencies_hz: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Validate a strictly increasing frequency vector."""
+
+    frequencies = np.asarray(
+        frequencies_hz,
+        dtype=np.float64,
+    )
+
+    if frequencies.ndim != 1:
+        raise ValueError(
+            "frequencies_hz must be one-dimensional."
+        )
+
+    if frequencies.size < 1:
+        raise ValueError(
+            "frequencies_hz must contain at least one value."
+        )
+
+    if not np.all(np.isfinite(frequencies)):
+        raise ValueError(
+            "frequencies_hz contains non-finite values."
+        )
+
+    if np.any(frequencies <= 0.0):
+        raise ValueError(
+            "All frequencies must be positive."
+        )
+
+    if frequencies.size > 1 and not np.all(
+        np.diff(frequencies) > 0.0
+    ):
+        raise ValueError(
+            "frequencies_hz must be strictly increasing."
+        )
+
+    return frequencies
+
+
+def _prepare_angles(
+    angles_deg: NDArray[np.float64] | None,
+) -> NDArray[np.float64]:
+    """Validate or generate an observation-angle vector."""
+
+    if angles_deg is None:
+        angles = np.linspace(
+            -90.0,
+            90.0,
+            1801,
+            dtype=np.float64,
+        )
+    else:
+        angles = np.asarray(
+            angles_deg,
+            dtype=np.float64,
+        )
+
+    if angles.ndim != 1:
+        raise ValueError(
+            "angles_deg must be one-dimensional."
+        )
+
+    if angles.size < 3:
+        raise ValueError(
+            "angles_deg must contain at least three values."
+        )
+
+    if not np.all(np.isfinite(angles)):
+        raise ValueError(
+            "angles_deg contains non-finite values."
+        )
+
+    if np.any(angles < -90.0) or np.any(
+        angles > 90.0
+    ):
+        raise ValueError(
+            "angles_deg must lie between -90 and 90 degrees."
+        )
+
+    if not np.all(
+        np.diff(angles) > 0.0
+    ):
+        raise ValueError(
+            "angles_deg must be strictly increasing."
+        )
+
+    return angles
+
+
+def _validate_array_inputs(
+    number_of_elements: int,
+    frequency_hz: float,
+    element_spacing_m: float,
+    steering_angle_deg: float,
+) -> None:
+    """Validate common ULA parameters."""
+
+    if isinstance(
+        number_of_elements,
+        bool,
+    ) or not isinstance(
+        number_of_elements,
+        (int, np.integer),
+    ):
+        raise TypeError(
+            "number_of_elements must be an integer."
+        )
+
+    if number_of_elements < 2:
+        raise ValueError(
+            "number_of_elements must be at least 2."
+        )
+
+    _validate_positive_finite(
+        frequency_hz,
+        name="frequency_hz",
+    )
+
+    _validate_positive_finite(
+        element_spacing_m,
+        name="element_spacing_m",
+    )
+
+    _validate_angle(
+        steering_angle_deg,
+        name="steering_angle_deg",
+    )
+
+
+def _validate_angle(
+    angle_deg: float,
+    *,
+    name: str,
+) -> None:
+    """Validate an angle measured from broadside."""
+
+    if not np.isfinite(angle_deg):
+        raise ValueError(
+            f"{name} must be finite."
+        )
+
+    if not -90.0 <= angle_deg <= 90.0:
+        raise ValueError(
+            f"{name} must lie between -90 and 90 degrees."
+        )
+
+
+def _validate_positive_finite(
+    value: float,
+    *,
+    name: str,
+) -> None:
+    """Validate a positive finite scalar."""
+
+    if not np.isfinite(value):
+        raise ValueError(
+            f"{name} must be finite."
+        )
+
+    if value <= 0.0:
+        raise ValueError(
+            f"{name} must be positive."
+        )
+
+
+def _validate_minimum_db(
+    minimum_db: float,
+) -> None:
+    """Validate a negative dB numerical floor."""
+
+    if not np.isfinite(minimum_db):
+        raise ValueError(
+            "minimum_db must be finite."
+        )
+
+    if minimum_db >= 0.0:
+        raise ValueError(
+            "minimum_db must be below 0 dB."
+        )
+```
