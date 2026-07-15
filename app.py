@@ -1,11 +1,3 @@
-```python
-"""Interactive Array Beamformer Studio.
-
-Run with:
-
-    streamlit run app.py
-"""
-
 from __future__ import annotations
 
 import numpy as np
