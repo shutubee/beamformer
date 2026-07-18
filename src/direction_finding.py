@@ -1,5 +1,3 @@
-```python
-"""Direction-of-arrival estimation for uniform linear antenna arrays."""
 
 from __future__ import annotations
 
@@ -1236,4 +1234,4 @@ def _validate_nonnegative_finite(
         raise ValueError(
             f"{name} cannot be negative."
         )
-```
+
