@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.adaptive_beamforming import (
+from src.adaptive_beamformer import (
     calculate_beamformer_response,
     estimate_sample_covariance,
     mvdr_weights,
