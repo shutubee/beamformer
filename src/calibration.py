@@ -1,5 +1,3 @@
-```python
-"""Element-level gain and phase calibration for phased antenna arrays."""
 
 from __future__ import annotations
 
