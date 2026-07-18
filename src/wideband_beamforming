@@ -1,4 +1,4 @@
-```python
+
 """Wideband phased-array and true-time-delay beamforming utilities."""
 
 from __future__ import annotations
@@ -923,4 +923,4 @@ def _validate_minimum_db(
         raise ValueError(
             "minimum_db must be below 0 dB."
         )
-```
+
