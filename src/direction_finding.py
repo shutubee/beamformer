@@ -1,13 +1,11 @@
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.signal import find_peaks
 
-from src.adaptive_beamforming import steering_vector_ula
+from src.adaptive_beamformer import steering_vector_ula
 
 
 @dataclass(frozen=True)
