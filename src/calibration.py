@@ -1430,4 +1430,4 @@ def _validate_nonnegative_finite(
         raise ValueError(
             f"{name} cannot be negative."
         )
-```
+
